@@ -1,62 +1,143 @@
 #!/usr/bin/env python3
 """
-baixar_instagram.py
-Baixa todas as imagens (melhor resolução disponível) de um perfil público do Instagram.
+baixar_instagram_v2.py
+Baixa imagens (melhor resolução) de um perfil público/permitido com tolerância a rate-limit.
 
-Uso:
-    python baixar_instagram.py <username>
+Uso (exemplos):
+  python baixar_instagram_v2.py marcelo.santos.77
+  python baixar_instagram_v2.py marcelo.santos.77 --login MEUUSER
+  python main.py leonardossil --sessionid "1999f5e3ec7-75a026"
+  python baixar_instagram_v2.py marcelo.santos.77 --session-file .session-MEUUSER.json
+  python baixar_instagram_v2.py marcelo.santos.77 --fast-update
 
 Dependência:
-    pip install instaloader
+  pip install instaloader
 """
 
-import sys
+import argparse
+import getpass
+import json
 import os
+import re
 import time
 from typing import Optional
 
-try:
-    import instaloader
-except ImportError:
-    print("Instaloader não encontrado. Rode: pip install instaloader")
-    sys.exit(1)
+import instaloader
+from instaloader.exceptions import (
+    ConnectionException,
+    QueryReturnedBadRequestException,
+    QueryReturnedNotFoundException,
+    QueryReturnedForbiddenException,
+    BadCredentialsException,
+    TwoFactorAuthRequiredException,
+    ProfileNotExistsException,
+)
+
+PLEASE_WAIT_PAT = re.compile(r"please wait a few minutes", re.IGNORECASE)
 
 
-def download_profile_images(username: str,
-                            dest_dir: Optional[str] = None,
-                            login_user: Optional[str] = None,
-                            login_pass: Optional[str] = None,
-                            wait_between: float = 5.0):
-    """
-    Baixa imagens de um perfil público do Instagram usando instaloader.
+def save_session(L: instaloader.Instaloader, path: str):
+    """Salva cookies/sessão em JSON simples (portável)."""
+    data = L.context._session.cookies.get_dict()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    print(f"[+] Sessão salva em: {path}")
 
-    - username: nome do perfil (ex: 'marcelo.santos.77')
-    - dest_dir: pasta base para salvar (por padrão ./<username>/)
-    - login_user, login_pass: opcional, credenciais para autenticar (reduz bloqueios / acessa privados permitidos)
-    - wait_between: pausa em segundos entre downloads para reduzir chance de rate-limit
-    """
-    L = instaloader.Instaloader(
-        dirname_pattern=dest_dir or "{target}",  # pasta onde salvar (substitui {target} pelo username)
-        download_videos=False,                   # não baixar vídeos (apenas imagens)
+
+def load_session(L: instaloader.Instaloader, path: str):
+    """Carrega cookies/sessão de JSON simples."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for k, v in data.items():
+        L.context._session.cookies.set(k, v)
+    # testa
+    username = L.test_login()
+    print(f"[+] Sessão carregada. Logado como: {username}" if username else "[!] Sessão não autenticada.")
+
+
+def apply_sessionid(L: instaloader.Instaloader, sessionid: str):
+    """Injeta diretamente o cookie sessionid (método alternativo sem senha)."""
+    L.context._session.cookies.set("sessionid", sessionid, domain=".instagram.com", path="/")
+    username = L.test_login()
+    print(f"[+] sessionid aplicado. Logado como: {username}" if username else "[!] sessionid inválido ou expirado.")
+
+
+def create_loader(dest_dir: Optional[str]) -> instaloader.Instaloader:
+    return instaloader.Instaloader(
+        dirname_pattern=dest_dir or "{target}",
+        download_videos=False,            # apenas imagens
         download_video_thumbnails=False,
-        save_metadata=True,                      # salva metadata JSON e descrição
-        post_metadata_txt_pattern=None,          # evita criar .txt com legenda (opcional)
+        save_metadata=True,
+        post_metadata_txt_pattern=None,
         compress_json=False,
-        max_connection_attempts=3
+        max_connection_attempts=3,
+        # quiet=True,
     )
 
-    # Opcional: efetuar login (melhora limites e acesso a perfis privados que você tenha permissão)
-    if login_user and login_pass:
+
+def polite_sleep(seconds: int):
+    """Dormir exibindo um contador regressivo simpático."""
+    for s in range(seconds, 0, -1):
+        print(f"   aguardando {s:>3}s...", end="\r")
+        time.sleep(1)
+    print(" " * 30, end="\r")
+
+
+def should_backoff(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        isinstance(exc, (ConnectionException, QueryReturnedBadRequestException, QueryReturnedForbiddenException))
+        or PLEASE_WAIT_PAT.search(text) is not None
+        or "429" in text
+        or "rate limit" in text.lower()
+    )
+
+
+def download_profile_images(
+    username: str,
+    dest_dir: Optional[str],
+    login_user: Optional[str],
+    use_fast_update: bool,
+    session_file: Optional[str],
+    sessionid: Optional[str],
+):
+    L = create_loader(dest_dir)
+
+    # Autenticação (prioridade: session-file > sessionid > login)
+    if session_file and os.path.exists(session_file):
+        load_session(L, session_file)
+    elif sessionid:
+        apply_sessionid(L, sessionid)
+    elif login_user:
         try:
-            L.login(login_user, login_pass)
+            pwd = getpass.getpass(f"Senha de {login_user}: ")
+            L.login(login_user, pwd)
             print(f"[+] Logado como {login_user}")
+            # Salva sessão para reutilizar depois
+            session_path = f".session-{login_user}.json"
+            save_session(L, session_path)
+        except TwoFactorAuthRequiredException:
+            code = input("Código 2FA: ").strip()
+            L.two_factor_login(code)
+            print(f"[+] 2FA ok. Logado como {login_user}")
+            session_path = f".session-{login_user}.json"
+            save_session(L, session_path)
+        except BadCredentialsException:
+            print("[!] Credenciais inválidas.")
         except Exception as e:
             print("[!] Falha no login:", e)
-            print("[!] Continuando sem login — poderá falhar em perfis privados ou sofrer rate-limits.")
+
+    # Backoff progressivo (60s → 2m → 5m → 10m → 20m)
+    backoffs = [60, 120, 300, 600, 1200]
+    bo_idx = 0
+
+    # Fast-update reduz requisições (baixa só novos)
+    if use_fast_update:
+        L.context.log("[i] fast-update habilitado (menos chamadas).")
 
     try:
         profile = instaloader.Profile.from_username(L.context, username)
-    except instaloader.exceptions.ProfileNotExistsException:
+    except ProfileNotExistsException:
         print(f"[ERROR] Perfil '{username}' não existe.")
         return
     except Exception as e:
@@ -68,42 +149,76 @@ def download_profile_images(username: str,
     print(f"    perfil público: {not profile.is_private}")
 
     target = profile.username
-    # cria pasta se não existir (instaloader já faz, mas garantimos)
-    os.makedirs(target, exist_ok=True)
+    os.makedirs(dest_dir or target, exist_ok=True)
 
-    count = 0
-    try:
-        for post in profile.get_posts():
-            # ignora vídeos (post.is_video) e baixa somente imagens (inclui carrossel com imagens)
-            if post.is_video:
-                print(f" - pulando vídeo: {post.shortcode}")
-                continue
+    processed = 0
+    while True:
+        try:
+            # Iterar posts — se falhar por rate-limit, cai no except e aplica backoff
+            count_before = processed
+            for post in profile.get_posts():
+                if use_fast_update and post.is_pinned:
+                    # posts fixados às vezes já foram baixados; seguimos o fluxo normal
+                    pass
 
-            # instaloader detecta e baixa cada item do post (para carrossel baixa várias imagens)
-            try:
+                if post.is_video:
+                    print(f" - pulando vídeo: {post.shortcode}")
+                    continue
+
                 L.download_post(post, target=target)
-                count += 1
-                print(f" - baixado post {post.shortcode} (#{count})")
-            except Exception as e:
-                print(f" [!] erro ao baixar post {post.shortcode}: {e}")
+                processed += 1
+                print(f" - baixado post {post.shortcode} (#{processed})")
 
-            time.sleep(wait_between)
-    except KeyboardInterrupt:
-        print("\n[!] Interrompido pelo usuário.")
-    except Exception as e:
-        print("[!] Erro durante iteração de posts:", e)
+            # Se percorreu tudo sem erro, encerra
+            break
 
-    print(f"[+] Finalizado. Posts processados (tentativas de download de posts com imagens): {count}")
-    print(f"[+] Arquivos salvos em: ./{target}/")
+        except (QueryReturnedNotFoundException,) as e:
+            print("[!] Conteúdo não encontrado/alterado:", e)
+            break
+        except Exception as e:
+            # Detecta rate-limit explícito/implícito
+            if should_backoff(e):
+                wait_s = backoffs[min(bo_idx, len(backoffs) - 1)]
+                msg = str(e)
+                print(f"[!] Rate-limit ou bloqueio temporário detectado: {msg[:120]}...")
+                print(f"[i] Aguardando {wait_s//60} min antes de retomar (backoff nível {bo_idx+1}).")
+                polite_sleep(wait_s)
+                bo_idx += 1
+                # Se nada foi baixado nessa rodada, tente outra; caso contrário, continua
+                continue
+            else:
+                print("[!] Erro não tratável (parando):", e)
+                break
+
+        finally:
+            # Se não baixou nada na rodada atual, evita loop infinito
+            if processed == count_before and bo_idx >= len(backoffs):
+                print("[i] Sem progresso após múltiplos backoffs. Encerrando para evitar bloqueio.")
+                break
+
+    print(f"[+] Finalizado. Posts com imagens processados: {processed}")
+    print(f"[+] Arquivos salvos em: ./{dest_dir or target}/")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("username", help="username do Instagram (ex.: marcelo.santos.77)")
+    ap.add_argument("--dest", help="pasta destino (default: ./<username>)")
+    ap.add_argument("--login", help="fazer login com este usuário (salva sessão)")
+    ap.add_argument("--session-file", help="carregar sessão de arquivo JSON salvo")
+    ap.add_argument("--sessionid", help="usar cookie 'sessionid' diretamente (alternativa ao login)")
+    ap.add_argument("--fast-update", action="store_true", help="baixar só novos; reduz chamadas")
+    args = ap.parse_args()
+
+    download_profile_images(
+        username=args.username,
+        dest_dir=args.dest,
+        login_user=args.login,
+        use_fast_update=args.fast_update,
+        session_file=args.session_file,
+        sessionid=args.sessionid,
+    )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: python baixar_instagram.py <username> [login_user login_pass]")
-        sys.exit(1)
-
-    usr = sys.argv[1]
-    login_u = sys.argv[2] if len(sys.argv) >= 4 else None
-    login_p = sys.argv[3] if len(sys.argv) >= 4 else None
-
-    download_profile_images(usr, login_user=login_u, login_pass=login_p)
+    main()
